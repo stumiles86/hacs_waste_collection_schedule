@@ -1,317 +1,235 @@
-import re
+import time
 from datetime import date, datetime, timedelta
 
 import requests
-from bs4 import BeautifulSoup
-from dateutil.rrule import FR, MO, SA, SU, TH, TU, WE, WEEKLY, rrule, weekday
 from waste_collection_schedule import Collection, Icons  # type: ignore[attr-defined]
 from waste_collection_schedule.exceptions import (
+    SourceArgumentExceptionMultiple,
     SourceArgumentNotFoundWithSuggestions,
     SourceArgumentRequired,
 )
 
-WEEKDAYS = {
-    "monday": MO,
-    "tuesday": TU,
-    "wednesday": WE,
-    "thursday": TH,
-    "friday": FR,
-    "saturday": SA,
-    "sunday": SU,
-}
-
 TITLE = "Thurrock"
-DESCRIPTION = "Source for Thurrock."
+DESCRIPTION = "Source for Thurrock Council waste collections (services.thurrock.gov.uk)."
 URL = "https://www.thurrock.gov.uk/"
 TEST_CASES = {
-    "Camden Close Chadwell St Mary": {
-        "street": "Camden Close",
-        "town": "Chadwell St Mary",
+    "Camden Close": {
+        "postcode": "RM16 4HT",
+        "house": "1",
     },
-    "Abberton Way West Thurrock (street starting with A)": {
-        "street": "Abberton Way",
-        "town": "West Thurrock",
+    "Abberton Way West Thurrock": {
+        "postcode": "RM20 3BB",
+        "house": "1",
     },
 }
-
 
 ICON_MAP = {
-    "Brown": Icons.ORGANIC,
-    "Blue": Icons.PAPER,
-    "Green": Icons.RECYCLING,
-    "Grey": Icons.RECYCLING,
-    "Green/Grey": Icons.RECYCLING,
+    "Refuse": Icons.GENERAL_WASTE,
+    "Recycling": Icons.RECYCLING,
+    "Food": Icons.BIO_KITCHEN,
+    "Garden": Icons.GARDEN,
 }
 
+SERVICE_MAP = {
+    "Domestic Empty Refuse 180": "Refuse",
+    "Domestic Empty Refuse 240": "Refuse",
+    "Domestic Empty Recycling 240": "Recycling",
+    "Domestic Empty Recycling 180": "Recycling",
+    "Domestic Empty 23L Food Caddy": "Food",
+    "Domestic Empty Food Caddy": "Food",
+    "Domestic Empty Garden 240": "Garden",
+    "Domestic Empty Garden": "Garden",
+}
 
-# Streets beginning with A use the base URL (no letter suffix).
-# All other letters append "-<letter>" to the base URL.
-STREETS_BASE_URL = (
-    "https://www.thurrock.gov.uk/household-bin-collection-days/street-names"
+BASE = "https://services.thurrock.gov.uk"
+SESSION_URL = f"{BASE}/en/service/Waste_and_recycling_bin_collection_schedule"
+AUTH_URL = (
+    f"{BASE}/authapi/isauthenticated"
+    "?uri=https%253A%252F%252Fservices.thurrock.gov.uk"
+    "%252Fen%252Fservice%252FWaste_and_recycling_bin_collection_schedule"
+    "&hostname=services.thurrock.gov.uk&withCredentials=true"
 )
-# /bindays redirects to the current weeks table page.
-API_URL = "https://www.thurrock.gov.uk/bindays"
-API_URL_FALLBACK = (
-    "https://www.thurrock.gov.uk/household-bin-collection-days/"
-    "general-residential-waste-and-recycling-collections"
-)
 
-# Matches both ASCII hyphen-minus (-) and Unicode en-dash (–) with optional surrounding whitespace.
-DATE_RANGE_RE = re.compile(r"\s*[-–—]\s*")
-# Matches " and " or " / " (with optional extra whitespace) as bin-type separators.
-BIN_SPLIT_RE = re.compile(r"\s*/\s*|\s+and\s+")
+LOOKUP_AUTH = "5f68c66dcc8f6"
+LOOKUP_ADDRESS = "67f50a0b2b240"
+LOOKUP_SCHEDULE = "6836e0d463cd2"
 
-# How many extra fortnights to project when the council table is short.
-PREDICT_WEEKS = 12
-# Minimum number of future collection *days* we want after today.
-MIN_FUTURE_DAYS = 4
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Content-Type": "application/json",
+}
+
+SCHEDULE_DAYS = 56
 
 
 class Source:
-    def __init__(self, street: str, town: str):
-        self._street: str = street
-        self._town: str = town
-        self._day: weekday | None = None
-        self._round: str | None = None
+    def __init__(self, postcode, house):
+        if not postcode:
+            raise SourceArgumentRequired("postcode", "a postcode is required")
+        if house is None or str(house).strip() == "":
+            raise SourceArgumentRequired("house", "a house number or name is required")
 
-    def _streets_url(self) -> str:
-        first = self._street[0].lower()
-        if first == "a":
-            return STREETS_BASE_URL
-        return f"{STREETS_BASE_URL}-{first}"
+        self._postcode = str(postcode).strip()
+        self._house = str(house).strip()
 
-    def fetch_day(self):
-        if len(self._street) == 0:
-            raise SourceArgumentRequired(
-                "street",
-                "Please provide a street name",
-            )
-        r = requests.get(self._streets_url(), verify=False)
-        r.raise_for_status()
-        soup = BeautifulSoup(
-            r.text.replace("&nbsp;", " ").replace("\xa0", " "), "html.parser"
+    def _run_lookup(self, session, sid, lookup_id, form_values, extra_top=None):
+        now = int(time.time() * 1000)
+        url = (
+            f"{BASE}/apibroker/runLookup?id={lookup_id}"
+            f"&repeat_against=&noRetry=false&getOnlyTokens=undefined"
+            f"&log_id=&app_name=AF-Renderer::Self&_={now}&sid={sid}"
         )
-        table = soup.select_one("table")
-        if not table:
-            raise Exception("street, town Table not found")
-        towns = []
-        streets = []
-        day_str = None
-        town_match = False
-        street_match = False
+        body = {"formValues": form_values}
+        if extra_top:
+            body.update(extra_top)
+        r = session.post(url, json=body, headers=HEADERS, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("status") == "error":
+            raise Exception(
+                f"Thurrock lookup {lookup_id} failed: {data.get('error')}"
+            )
+        return data.get("integration", {}).get("transformed", {}).get("rows_data") or {}
 
-        for row in table.select("tr")[1:]:
-            cells = row.select("td")
-            if len(cells) != 3:
-                continue
-            # Use rsplit to handle street names that contain ", " (e.g. parenthetical notes)
-            parts = cells[0].text.strip().rsplit(", ", 1)
-            if len(parts) != 2:
-                continue
-            street, town = parts
+    def _get_session(self):
+        session = requests.Session()
+        session.headers.update({"User-Agent": HEADERS["User-Agent"]})
+        session.get(SESSION_URL, timeout=30).raise_for_status()
+        auth = session.get(AUTH_URL, timeout=30).json()
+        sid = auth["auth-session"]
+        rows = self._run_lookup(session, sid, LOOKUP_AUTH, {"Section 1": {}})
+        token = next(iter(rows.values()))["AuthenticateResponse"]
+        return session, sid, token
 
-            towns.append(town.strip().casefold())
-            streets.append(street.strip().casefold())
-            if self._street.casefold() in street.casefold():
-                street_match = True
-            if self._town.casefold() in town.casefold():
-                town_match = True
-            if street_match and town_match:
-                day_str = cells[1].text.strip()
-                self._round = cells[2].text.strip()
-                break
-        if not day_str:
-            if town_match:
-                raise SourceArgumentNotFoundWithSuggestions(
-                    "street",
-                    self._street,
-                    streets,
-                )
-            raise SourceArgumentNotFoundWithSuggestions(
-                "town",
-                self._town,
-                towns,
+    def _resolve_uprn(self, session, sid, token):
+        rows = self._run_lookup(
+            session,
+            sid,
+            LOOKUP_ADDRESS,
+            {
+                "Section 1": {
+                    "AuthenticateResponse": {
+                        "name": "AuthenticateResponse",
+                        "value": token,
+                    },
+                    "postcode_search": {
+                        "name": "postcode_search",
+                        "value": self._postcode,
+                    },
+                }
+            },
+        )
+        if not rows:
+            raise SourceArgumentExceptionMultiple(
+                ["postcode", "house"],
+                f"No addresses found for postcode '{self._postcode}'",
             )
 
-        if day_str.lower() not in WEEKDAYS:
-            raise Exception(f"Day ({day_str}) not a valid weekday")
-        self._day = WEEKDAYS[day_str.lower()]
+        candidates = list(rows.values())
+        want = self._house.casefold()
+        matched = []
+        for row in candidates:
+            house = (row.get("house") or "").strip().casefold()
+            display = (row.get("display") or "").casefold()
+            flat_house = (row.get("flatHouse") or "").strip().casefold()
+            first_part = display.split(",")[0].strip()
 
-    def parse_date_range(self, range_str: str) -> tuple[date, date]:
-        """Parse a date range such as '18 May - 22 May' or '25 May – 29 May'."""
-        now = datetime.now()
-        parts = DATE_RANGE_RE.split(range_str.strip())
-        if len(parts) != 2:
-            raise ValueError(f"Cannot parse date range: {range_str!r}")
-        start_str, end_str = parts
-        start_date = datetime.strptime(
-            start_str.strip() + f" {now.year}", "%d %B %Y"
-        ).date()
-        end_date = datetime.strptime(
-            end_str.strip() + f" {now.year}", "%d %B %Y"
-        ).date()
-        # Handle a range that straddles a year boundary (e.g. 30 Dec - 3 Jan)
-        if start_date.month == 12 and end_date.month == 1:
-            end_date = end_date.replace(year=start_date.year + 1)
-        # If both ends are far in the past relative to today (e.g. table still
-        # showing last calendar year in January), bump to next year.
-        if end_date < now.date() - timedelta(days=180):
-            start_date = start_date.replace(year=start_date.year + 1)
-            end_date = end_date.replace(year=end_date.year + 1)
-        return start_date, end_date
-
-    @staticmethod
-    def _normalise_bin_label(bin_text: str) -> str:
-        """Collapse 'Green / Grey' style labels into a single type name."""
-        text = " ".join(bin_text.split())
-        # Prefer the combined label when both green and grey appear together.
-        lower = text.casefold()
-        if "green" in lower and "grey" in lower:
-            return "Green/Grey"
-        if "green" in lower and "gray" in lower:
-            return "Green/Grey"
-        return text
-
-    def _bins_from_cell(self, bin_text: str) -> list[str]:
-        normalised = self._normalise_bin_label(bin_text)
-        if normalised == "Green/Grey":
-            return ["Green/Grey"]
-        return [b.strip() for b in BIN_SPLIT_RE.split(bin_text) if b.strip()]
-
-    def _entries_for_week(
-        self, start_date: date, end_date: date, bins: list[str]
-    ) -> list[Collection]:
-        assert self._day is not None
-        entries: list[Collection] = []
-        for bin_type in bins:
-            for col_date in rrule(
-                WEEKLY,
-                dtstart=start_date,
-                until=end_date,
-                byweekday=self._day,
+            if (
+                house == want
+                or flat_house == want
+                or first_part == want
+                or first_part.startswith(want + " ")
+                or display.startswith(want + " ")
             ):
-                entries.append(
-                    Collection(
-                        date=col_date.date(),
-                        t=bin_type,
-                        icon=ICON_MAP.get(bin_type),
-                    )
-                )
-        return entries
+                matched.append(row)
 
-    def _predict_forward(
-        self,
-        last_start: date,
-        last_end: date,
-        last_bins: list[str],
-        prev_bins: list[str] | None,
-    ) -> list[Collection]:
-        """
-        Extend the alternating fortnightly pattern beyond the published table.
+        if len(matched) == 1:
+            return str(matched[0]["uprn"])
 
-        Thurrock alternates Round A / Round B bin sets each Mon-Fri week.
-        When the council page only lists a short rolling window, sensors would
-        otherwise go unknown once that window is exhausted.
-        """
-        assert self._day is not None
-        entries: list[Collection] = []
+        suggestions = [c.get("display") or c.get("uprn") for c in candidates[:20]]
+        raise SourceArgumentNotFoundWithSuggestions(
+            "house",
+            self._house,
+            suggestions,
+        )
 
-        # Determine the two alternating bin sets.
-        set_a = last_bins
-        set_b = prev_bins if prev_bins else self._alternate_bins(last_bins)
+    def _friendly_type(self, service_name):
+        if service_name in SERVICE_MAP:
+            return SERVICE_MAP[service_name]
+        name = service_name.casefold()
+        if "fly tip" in name or "missed" in name or "bulky" in name:
+            return None
+        if "food" in name:
+            return "Food"
+        if "recycl" in name:
+            return "Recycling"
+        if "garden" in name or "green waste" in name:
+            return "Garden"
+        if "refuse" in name or "residual" in name or "general" in name:
+            return "Refuse"
+        return service_name
 
-        week_start = last_start + timedelta(days=7)
-        week_end = last_end + timedelta(days=7)
-        use_a = False  # next week after last published uses the other set
-
-        for _ in range(PREDICT_WEEKS):
-            bins = set_b if use_a is False else set_a
-            # After first predicted week, swap which set is "current".
-            # use_a False -> set_b (alternate of last), then True -> set_a, etc.
-            if use_a:
-                bins = set_a
-            else:
-                bins = set_b
-            entries.extend(self._entries_for_week(week_start, week_end, bins))
-            week_start += timedelta(days=7)
-            week_end += timedelta(days=7)
-            use_a = not use_a
-
-        return entries
-
-    @staticmethod
-    def _alternate_bins(bins: list[str]) -> list[str]:
-        """Guess the other fortnight's bins when only one week is known."""
-        joined = " ".join(bins).casefold()
-        if "blue" in joined or "brown" in joined:
-            return ["Green/Grey"]
-        return ["Blue", "Brown"]
-
-    def _load_weeks_table(self) -> BeautifulSoup:
-        last_error: Exception | None = None
-        for url in (API_URL, API_URL_FALLBACK):
-            try:
-                r = requests.get(url, verify=False, timeout=30)
-                r.raise_for_status()
-                soup = BeautifulSoup(r.text.replace("\xa0", " "), "html.parser")
-                if soup.select_one("table"):
-                    return soup
-            except Exception as exc:  # noqa: BLE001 - try fallback URL
-                last_error = exc
-        if last_error:
-            raise last_error
-        raise Exception("Collection table not found")
-
-    def fetch(self) -> list[Collection]:
-        if self._day is None or self._round is None:
-            self.fetch_day()
-            assert self._day is not None
-            assert self._round is not None
-
-        soup = self._load_weeks_table()
-        table = soup.select_one("table")
-        if not table:
-            raise Exception("Collection table not found")
-
-        entries: list[Collection] = []
-        week_rows: list[tuple[date, date, list[str]]] = []
-
-        for tr in table.select("tr")[1:]:
-            cells = tr.select("td")
-            if len(cells) != 3:
-                # Skip malformed / holiday note rows instead of aborting.
-                continue
-            try:
-                start_date, end_date = self.parse_date_range(cells[0].text.strip())
-            except ValueError:
-                continue
-
-            bin_text = cells[(1 if self._round == "A" else 2)].text.strip()
-            bins = self._bins_from_cell(bin_text)
-            if not bins:
-                continue
-            week_rows.append((start_date, end_date, bins))
-            entries.extend(self._entries_for_week(start_date, end_date, bins))
-
-        if not week_rows:
-            raise Exception("No collection weeks parsed from council table")
+    def fetch(self):
+        session, sid, token = self._get_session()
+        uprn = self._resolve_uprn(session, sid, token)
 
         today = date.today()
-        future_dates = {e.date for e in entries if e.date >= today}
+        min_d = today.isoformat()
+        max_d = (today + timedelta(days=SCHEDULE_DAYS)).isoformat()
 
-        # Council often only publishes ~6-8 weeks. Project the alternating
-        # pattern so sensors do not go unknown when the table rolls off.
-        if len(future_dates) < MIN_FUTURE_DAYS:
-            week_rows.sort(key=lambda w: w[0])
-            last_start, last_end, last_bins = week_rows[-1]
-            prev_bins = week_rows[-2][2] if len(week_rows) >= 2 else None
-            predicted = self._predict_forward(
-                last_start, last_end, last_bins, prev_bins
+        rows = self._run_lookup(
+            session,
+            sid,
+            LOOKUP_SCHEDULE,
+            {
+                "Section 1": {
+                    "AuthenticateResponse": {
+                        "name": "AuthenticateResponse",
+                        "value": token,
+                    },
+                    "LookupUPRN": {"name": "LookupUPRN", "value": uprn},
+                    "txtAddress": {"name": "txtAddress", "value": uprn},
+                    "MinLimitDate": {"name": "MinLimitDate", "value": min_d},
+                    "MaxLimitDate": {"name": "MaxLimitDate", "value": max_d},
+                }
+            },
+            extra_top={
+                "stopOnFailure": True,
+                "usePHPIntegrations": True,
+                "stage_id": "AF-Stage-78254f6b-c18e-4827-89a3-a338921fc776",
+                "stage_name": "Initial request",
+                "formId": "AF-Form-1d05ee4f-0bd0-4161-bfa0-c3ad46e94196",
+                "isPublished": True,
+                "formName": "Waste and recycling - collection schedules",
+                "processId": "AF-Process-539e654b-482b-4bd2-991b-0015bbbf2c70",
+            },
+        )
+
+        entries = []
+        for row in rows.values():
+            name = (row.get("Name") or "").strip()
+            start = (row.get("ScheduledStart") or "").strip()
+            if not name or not start:
+                continue
+            friendly = self._friendly_type(name)
+            if friendly is None:
+                continue
+            try:
+                col_date = datetime.fromisoformat(start).date()
+            except ValueError:
+                col_date = datetime.strptime(start[:10], "%Y-%m-%d").date()
+            entries.append(
+                Collection(
+                    date=col_date,
+                    t=friendly,
+                    icon=ICON_MAP.get(friendly),
+                )
             )
-            # Avoid duplicates with already-parsed dates.
-            existing = {(e.date, e.type) for e in entries}
-            for e in predicted:
-                if (e.date, e.type) not in existing:
-                    entries.append(e)
+
+        if not entries:
+            raise Exception(
+                f"No collection dates returned for {self._house}, {self._postcode}. "
+                "The council form only supports houses and bag-only properties."
+            )
 
         return entries
