@@ -1,5 +1,5 @@
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import requests
 from bs4 import BeautifulSoup
@@ -49,12 +49,22 @@ ICON_MAP = {
 STREETS_BASE_URL = (
     "https://www.thurrock.gov.uk/household-bin-collection-days/street-names"
 )
+# /bindays redirects to the current weeks table page.
 API_URL = "https://www.thurrock.gov.uk/bindays"
+API_URL_FALLBACK = (
+    "https://www.thurrock.gov.uk/household-bin-collection-days/"
+    "general-residential-waste-and-recycling-collections"
+)
 
 # Matches both ASCII hyphen-minus (-) and Unicode en-dash (–) with optional surrounding whitespace.
 DATE_RANGE_RE = re.compile(r"\s*[-–—]\s*")
 # Matches " and " or " / " (with optional extra whitespace) as bin-type separators.
 BIN_SPLIT_RE = re.compile(r"\s*/\s*|\s+and\s+")
+
+# How many extra fortnights to project when the council table is short.
+PREDICT_WEEKS = 12
+# Minimum number of future collection *days* we want after today.
+MIN_FUTURE_DAYS = 4
 
 
 class Source:
@@ -143,7 +153,114 @@ class Source:
         # Handle a range that straddles a year boundary (e.g. 30 Dec - 3 Jan)
         if start_date.month == 12 and end_date.month == 1:
             end_date = end_date.replace(year=start_date.year + 1)
+        # If both ends are far in the past relative to today (e.g. table still
+        # showing last calendar year in January), bump to next year.
+        if end_date < now.date() - timedelta(days=180):
+            start_date = start_date.replace(year=start_date.year + 1)
+            end_date = end_date.replace(year=end_date.year + 1)
         return start_date, end_date
+
+    @staticmethod
+    def _normalise_bin_label(bin_text: str) -> str:
+        """Collapse 'Green / Grey' style labels into a single type name."""
+        text = " ".join(bin_text.split())
+        # Prefer the combined label when both green and grey appear together.
+        lower = text.casefold()
+        if "green" in lower and "grey" in lower:
+            return "Green/Grey"
+        if "green" in lower and "gray" in lower:
+            return "Green/Grey"
+        return text
+
+    def _bins_from_cell(self, bin_text: str) -> list[str]:
+        normalised = self._normalise_bin_label(bin_text)
+        if normalised == "Green/Grey":
+            return ["Green/Grey"]
+        return [b.strip() for b in BIN_SPLIT_RE.split(bin_text) if b.strip()]
+
+    def _entries_for_week(
+        self, start_date: date, end_date: date, bins: list[str]
+    ) -> list[Collection]:
+        assert self._day is not None
+        entries: list[Collection] = []
+        for bin_type in bins:
+            for col_date in rrule(
+                WEEKLY,
+                dtstart=start_date,
+                until=end_date,
+                byweekday=self._day,
+            ):
+                entries.append(
+                    Collection(
+                        date=col_date.date(),
+                        t=bin_type,
+                        icon=ICON_MAP.get(bin_type),
+                    )
+                )
+        return entries
+
+    def _predict_forward(
+        self,
+        last_start: date,
+        last_end: date,
+        last_bins: list[str],
+        prev_bins: list[str] | None,
+    ) -> list[Collection]:
+        """
+        Extend the alternating fortnightly pattern beyond the published table.
+
+        Thurrock alternates Round A / Round B bin sets each Mon-Fri week.
+        When the council page only lists a short rolling window, sensors would
+        otherwise go unknown once that window is exhausted.
+        """
+        assert self._day is not None
+        entries: list[Collection] = []
+
+        # Determine the two alternating bin sets.
+        set_a = last_bins
+        set_b = prev_bins if prev_bins else self._alternate_bins(last_bins)
+
+        week_start = last_start + timedelta(days=7)
+        week_end = last_end + timedelta(days=7)
+        use_a = False  # next week after last published uses the other set
+
+        for _ in range(PREDICT_WEEKS):
+            bins = set_b if use_a is False else set_a
+            # After first predicted week, swap which set is "current".
+            # use_a False -> set_b (alternate of last), then True -> set_a, etc.
+            if use_a:
+                bins = set_a
+            else:
+                bins = set_b
+            entries.extend(self._entries_for_week(week_start, week_end, bins))
+            week_start += timedelta(days=7)
+            week_end += timedelta(days=7)
+            use_a = not use_a
+
+        return entries
+
+    @staticmethod
+    def _alternate_bins(bins: list[str]) -> list[str]:
+        """Guess the other fortnight's bins when only one week is known."""
+        joined = " ".join(bins).casefold()
+        if "blue" in joined or "brown" in joined:
+            return ["Green/Grey"]
+        return ["Blue", "Brown"]
+
+    def _load_weeks_table(self) -> BeautifulSoup:
+        last_error: Exception | None = None
+        for url in (API_URL, API_URL_FALLBACK):
+            try:
+                r = requests.get(url, verify=False, timeout=30)
+                r.raise_for_status()
+                soup = BeautifulSoup(r.text.replace("\xa0", " "), "html.parser")
+                if soup.select_one("table"):
+                    return soup
+            except Exception as exc:  # noqa: BLE001 - try fallback URL
+                last_error = exc
+        if last_error:
+            raise last_error
+        raise Exception("Collection table not found")
 
     def fetch(self) -> list[Collection]:
         if self._day is None or self._round is None:
@@ -151,38 +268,50 @@ class Source:
             assert self._day is not None
             assert self._round is not None
 
-        r = requests.get(API_URL, verify=False)
-        r.raise_for_status()
-
-        soup = BeautifulSoup(r.text.replace("\xa0", " "), "html.parser")
+        soup = self._load_weeks_table()
         table = soup.select_one("table")
         if not table:
             raise Exception("Collection table not found")
 
-        entries = []
+        entries: list[Collection] = []
+        week_rows: list[tuple[date, date, list[str]]] = []
 
         for tr in table.select("tr")[1:]:
             cells = tr.select("td")
             if len(cells) != 3:
-                raise Exception("Invalid table format")
-            start_date, end_date = self.parse_date_range(cells[0].text.strip())
+                # Skip malformed / holiday note rows instead of aborting.
+                continue
+            try:
+                start_date, end_date = self.parse_date_range(cells[0].text.strip())
+            except ValueError:
+                continue
 
             bin_text = cells[(1 if self._round == "A" else 2)].text.strip()
-            bins = [b.strip() for b in BIN_SPLIT_RE.split(bin_text) if b.strip()]
+            bins = self._bins_from_cell(bin_text)
+            if not bins:
+                continue
+            week_rows.append((start_date, end_date, bins))
+            entries.extend(self._entries_for_week(start_date, end_date, bins))
 
-            for bin_type in bins:
-                for col_date in rrule(
-                    WEEKLY,
-                    dtstart=start_date,
-                    until=end_date,
-                    byweekday=self._day,
-                ):
-                    entries.append(
-                        Collection(
-                            date=col_date.date(),
-                            t=bin_type,
-                            icon=ICON_MAP.get(bin_type),
-                        )
-                    )
+        if not week_rows:
+            raise Exception("No collection weeks parsed from council table")
+
+        today = date.today()
+        future_dates = {e.date for e in entries if e.date >= today}
+
+        # Council often only publishes ~6-8 weeks. Project the alternating
+        # pattern so sensors do not go unknown when the table rolls off.
+        if len(future_dates) < MIN_FUTURE_DAYS:
+            week_rows.sort(key=lambda w: w[0])
+            last_start, last_end, last_bins = week_rows[-1]
+            prev_bins = week_rows[-2][2] if len(week_rows) >= 2 else None
+            predicted = self._predict_forward(
+                last_start, last_end, last_bins, prev_bins
+            )
+            # Avoid duplicates with already-parsed dates.
+            existing = {(e.date, e.type) for e in entries}
+            for e in predicted:
+                if (e.date, e.type) not in existing:
+                    entries.append(e)
 
         return entries
